@@ -75,12 +75,14 @@
   };
 
   window.fetch = async (...args) => {
-    const [, init] = args;
+    const [resource, init] = args;
 
-    if (init && typeof init.body === "string") {
+    const url = String(resource?.url ?? resource ?? "");
+
+    if (/api\.mistral\.ai/i.test(url) && typeof init?.body === "string") {
       try {
         const body = JSON.parse(init.body);
-        if (Array.isArray(body.messages) && /mistral/i.test(body.model || "")) {
+        if (Array.isArray(body.messages)) {
           const chat = await getActiveChat();
           const stored = (chat?.messages || [])
             .filter((m) => m.role === "assistant")
