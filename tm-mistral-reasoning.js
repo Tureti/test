@@ -1,50 +1,46 @@
 (() => {
+  const VERSION = "v2";
   const origFetch = window.fetch.bind(window);
 
-  const readStore = (db, storeName, key) =>
+  const readStore = (db, store, key) =>
     new Promise((res) => {
-      const r = db.transaction(storeName, "readonly").objectStore(storeName).get(key);
+      const r = db.transaction(store, "readonly").objectStore(store).get(key);
       r.onsuccess = () => res(r.result || null);
       r.onerror = () => res(null);
     });
 
   const getActiveChat = async () => {
-    const id = (localStorage.getItem("TM_useLastOpenedChatID") || "").replace(/^"|"$/g, "");
-    if (!id) return null;
+    const hashId = (location.hash.match(/chat=([^&]+)/) || [])[1];
+    const lsId = (localStorage.getItem("TM_useLastOpenedChatID") || "").replace(/^"|"$/g, "");
+    const id = hashId || lsId;
+    if (!id) return { id: null, chat: null };
 
     const db = await new Promise((res) => {
       const r = indexedDB.open("keyval-store");
       r.onsuccess = () => res(r.result);
       r.onerror = () => res(null);
     });
-    if (!db) return null;
+    if (!db) return { id, chat: null };
 
     try {
-      const storeName = db.objectStoreNames.contains("keyval")
-        ? "keyval"
-        : db.objectStoreNames[0];
-      return (
-        (await readStore(db, storeName, `CHAT_${id}`)) ||
-        (await readStore(db, storeName, id))
-      );
+      const store = db.objectStoreNames.contains("keyval") ? "keyval" : db.objectStoreNames[0];
+      const chat = (await readStore(db, store, `CHAT_${id}`)) || (await readStore(db, store, id));
+      return { id, chat };
     } finally {
       db.close();
     }
   };
 
-  const extractThinkingAndText = (m) => {
+  const norm = (s) => (s || "").replace(/\r\n/g, "\n").trim();
+
+  const extract = (m) => {
     let thinking = "";
     let text = "";
 
     const rawThink =
-      m?.thinking ??
-      m?.thinkingContent ??
-      m?.reasoning ??
-      m?.reasoning_content ??
-      m?.reasoningContent;
-    if (typeof rawThink === "string") {
-      thinking = rawThink;
-    } else if (Array.isArray(rawThink)) {
+      m?.thinking ?? m?.thinkingContent ?? m?.reasoning ?? m?.reasoning_content ?? m?.reasoningContent;
+    if (typeof rawThink === "string") thinking = rawThink;
+    else if (Array.isArray(rawThink)) {
       thinking = rawThink.map((t) => (typeof t === "string" ? t : t?.text || "")).join("");
     }
 
@@ -71,28 +67,28 @@
       }
     }
 
-    return { thinking: thinking.trim(), text: text.trim() };
+    return { thinking: norm(thinking), text: norm(text) };
   };
 
   window.fetch = async (...args) => {
     const [resource, init] = args;
-
     const url = String(resource?.url ?? resource ?? "");
 
     if (/api\.mistral\.ai/i.test(url) && typeof init?.body === "string") {
       try {
         const body = JSON.parse(init.body);
         if (Array.isArray(body.messages)) {
-          const chat = await getActiveChat();
-          const stored = (chat?.messages || [])
-            .filter((m) => m.role === "assistant")
-            .map(extractThinkingAndText)
-            .filter((m) => m.thinking && m.text);
+          const { id, chat } = await getActiveChat();
+          const assistantMsgs = (chat?.messages || []).filter((m) => m.role === "assistant");
+          const stored = assistantMsgs.map(extract).filter((m) => m.thinking && m.text);
 
           let injected = 0;
           body.messages = body.messages.map((msg) => {
             if (msg.role === "assistant" && typeof msg.content === "string") {
-              const idx = stored.findIndex((s) => s.text === msg.content.trim());
+              const target = norm(msg.content);
+              const idx = stored.findIndex(
+                (s) => s.text === target || (target.length > 40 && s.text.startsWith(target.slice(0, 80)))
+              );
               if (idx !== -1) {
                 const [hit] = stored.splice(idx, 1);
                 injected++;
@@ -108,16 +104,26 @@
             return msg;
           });
 
+          console.log(`[Mistral Reasoning ${VERSION}]`, {
+            model: body.model,
+            chatId: id,
+            assistantInDB: assistantMsgs.length,
+            withThinking: injected + stored.length,
+            injected,
+            sampleKeys: assistantMsgs[0] ? Object.keys(assistantMsgs[0]) : [],
+          });
+
           if (injected > 0) {
-            console.log(`[Mistral Reasoning] Injected ${injected} turn(s) from IndexedDB.`);
             args[1] = { ...init, body: JSON.stringify(body) };
           }
         }
-      } catch {}
+      } catch (err) {
+        console.error(`[Mistral Reasoning ${VERSION}] Error:`, err);
+      }
     }
 
     return origFetch(...args);
   };
 
-  console.log("✅ [Mistral Reasoning] IndexedDB extension loaded.");
+  console.log(`✅ [Mistral Reasoning ${VERSION}] Loaded.`);
 })();
