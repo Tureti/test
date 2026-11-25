@@ -1,129 +1,68 @@
 (() => {
-  const VERSION = "v2";
   const origFetch = window.fetch.bind(window);
-
-  const readStore = (db, store, key) =>
+  const norm = (s) => (s || "").replace(/\r\n/g, "\n").trim();
+  const req = (r) =>
     new Promise((res) => {
-      const r = db.transaction(store, "readonly").objectStore(store).get(key);
       r.onsuccess = () => res(r.result || null);
       r.onerror = () => res(null);
     });
 
-  const getActiveChat = async () => {
-    const hashId = (location.hash.match(/chat=([^&]+)/) || [])[1];
-    const lsId = (localStorage.getItem("TM_useLastOpenedChatID") || "").replace(/^"|"$/g, "");
-    const id = hashId || lsId;
-    if (!id) return { id: null, chat: null };
-
-    const db = await new Promise((res) => {
-      const r = indexedDB.open("keyval-store");
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => res(null);
-    });
-    if (!db) return { id, chat: null };
-
+  const getChat = async () => {
+    const id =
+      (location.hash.match(/chat=([^&]+)/) || [])[1] ||
+      (localStorage.getItem("TM_useLastOpenedChatID") || "").replace(/^"|"$/g, "");
+    const db = id ? await req(indexedDB.open("keyval-store")) : null;
+    if (!db) return null;
+    const get = (k) => req(db.transaction("keyval", "readonly").objectStore("keyval").get(k));
     try {
-      const store = db.objectStoreNames.contains("keyval") ? "keyval" : db.objectStoreNames[0];
-      const chat = (await readStore(db, store, `CHAT_${id}`)) || (await readStore(db, store, id));
-      return { id, chat };
+      return (await get(`CHAT_${id}`)) || (await get(id));
     } finally {
       db.close();
     }
   };
 
-  const norm = (s) => (s || "").replace(/\r\n/g, "\n").trim();
-
-  const extract = (m) => {
-    let thinking = "";
-    let text = "";
-
-    const rawThink =
-      m?.thinking ?? m?.thinkingContent ?? m?.reasoning ?? m?.reasoning_content ?? m?.reasoningContent;
-    if (typeof rawThink === "string") thinking = rawThink;
-    else if (Array.isArray(rawThink)) {
-      thinking = rawThink.map((t) => (typeof t === "string" ? t : t?.text || "")).join("");
-    }
-
-    if (typeof m?.content === "string") {
-      const match = m.content.match(/<think([\s\S]*?)<\/think>\s*([\s\S]*)/i);
-      if (match) {
-        thinking = thinking || match[1];
-        text = match[2];
-      } else {
-        text = m.content;
-      }
-    } else if (Array.isArray(m?.content)) {
-      for (const p of m.content) {
-        if (p?.type === "thinking") {
-          thinking +=
-            typeof p.thinking === "string"
-              ? p.thinking
-              : Array.isArray(p.thinking)
-                ? p.thinking.map((t) => t?.text || "").join("")
-                : p.text || "";
-        } else if (p?.type === "text" && typeof p.text === "string") {
-          text += p.text;
-        }
+  const extract = ({ content }) => {
+    if (!Array.isArray(content)) return null;
+    let thinking = "", text = "";
+    for (const p of content) {
+      if (p?.type === "thinking") {
+        thinking += [].concat(p.thinking || p.text || "").map((t) => t?.text ?? t ?? "").join("");
+      } else if (p?.type === "text") {
+        text += p.text || "";
       }
     }
-
-    return { thinking: norm(thinking), text: norm(text) };
+    thinking = norm(thinking);
+    text = norm(text);
+    return thinking && text ? { thinking, text } : null;
   };
 
   window.fetch = async (...args) => {
     const [resource, init] = args;
-    const url = String(resource?.url ?? resource ?? "");
-
-    if (/api\.mistral\.ai/i.test(url) && typeof init?.body === "string") {
+    if (/api\.mistral\.ai/i.test(resource?.url ?? resource ?? "") && typeof init?.body === "string") {
       try {
         const body = JSON.parse(init.body);
-        if (Array.isArray(body.messages)) {
-          const { id, chat } = await getActiveChat();
-          const assistantMsgs = (chat?.messages || []).filter((m) => m.role === "assistant");
-          const stored = assistantMsgs.map(extract).filter((m) => m.thinking && m.text);
+        const chat = Array.isArray(body.messages) ? await getChat() : null;
+        const stored = (chat?.messages || []).filter((m) => m?.role === "assistant").map(extract).filter(Boolean);
 
-          let injected = 0;
+        if (stored.length) {
+          let changed = false;
           body.messages = body.messages.map((msg) => {
-            if (msg.role === "assistant" && typeof msg.content === "string") {
-              const target = norm(msg.content);
-              const idx = stored.findIndex(
-                (s) => s.text === target || (target.length > 40 && s.text.startsWith(target.slice(0, 80)))
-              );
-              if (idx !== -1) {
-                const [hit] = stored.splice(idx, 1);
-                injected++;
-                return {
-                  ...msg,
-                  content: [
-                    { type: "thinking", thinking: [{ type: "text", text: hit.thinking }] },
-                    { type: "text", text: msg.content },
-                  ],
-                };
-              }
-            }
-            return msg;
+            if (msg.role !== "assistant" || typeof msg.content !== "string") return msg;
+            const i = stored.findIndex((s) => s.text === norm(msg.content));
+            if (i === -1) return msg;
+            changed = true;
+            return {
+              ...msg,
+              content: [
+                { type: "thinking", thinking: [{ type: "text", text: stored.splice(i, 1)[0].thinking }] },
+                { type: "text", text: msg.content },
+              ],
+            };
           });
-
-          console.log(`[Mistral Reasoning ${VERSION}]`, {
-            model: body.model,
-            chatId: id,
-            assistantInDB: assistantMsgs.length,
-            withThinking: injected + stored.length,
-            injected,
-            sampleKeys: assistantMsgs[0] ? Object.keys(assistantMsgs[0]) : [],
-          });
-
-          if (injected > 0) {
-            args[1] = { ...init, body: JSON.stringify(body) };
-          }
+          if (changed) args[1] = { ...init, body: JSON.stringify(body) };
         }
-      } catch (err) {
-        console.error(`[Mistral Reasoning ${VERSION}] Error:`, err);
-      }
+      } catch {}
     }
-
     return origFetch(...args);
   };
-
-  console.log(`✅ [Mistral Reasoning ${VERSION}] Loaded.`);
 })();
