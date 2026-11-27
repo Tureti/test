@@ -21,7 +21,7 @@
     }
   };
 
-  const extract = ({ content }) => {
+  const extract = ({ content, tool_calls }) => {
     if (!Array.isArray(content)) return null;
     let thinking = "", text = "";
     for (const p of content) {
@@ -31,9 +31,10 @@
         text += p.text || "";
       }
     }
+    const toolId = tool_calls?.[0]?.id;
     thinking = norm(thinking);
     text = norm(text);
-    return thinking && text ? { thinking, text } : null;
+    return thinking && (text || toolId) ? { thinking, text, toolId } : null;
   };
 
   window.fetch = async (...args) => {
@@ -47,15 +48,22 @@
         if (stored.length) {
           let changed = false;
           body.messages = body.messages.map((msg) => {
-            if (msg.role !== "assistant" || typeof msg.content !== "string") return msg;
-            const i = stored.findIndex((s) => s.text === norm(msg.content));
+            if (msg.role !== "assistant" || msg.content?.some?.((p) => p?.type === "thinking")) return msg;
+            const i = msg.tool_calls?.length
+              ? stored.findIndex((s) => s.toolId && msg.tool_calls.some((t) => t.id === s.toolId))
+              : typeof msg.content === "string"
+                ? stored.findIndex((s) => !s.toolId && s.text === norm(msg.content))
+                : -1;
             if (i === -1) return msg;
             changed = true;
+            const block = { type: "thinking", thinking: [{ type: "text", text: stored.splice(i, 1)[0].thinking }] };
             return {
               ...msg,
               content: [
-                { type: "thinking", thinking: [{ type: "text", text: stored.splice(i, 1)[0].thinking }] },
-                { type: "text", text: msg.content },
+                block,
+                ...(typeof msg.content === "string"
+                  ? (norm(msg.content) ? [{ type: "text", text: msg.content }] : [])
+                  : msg.content || []),
               ],
             };
           });
